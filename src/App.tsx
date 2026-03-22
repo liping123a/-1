@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   LayoutDashboard, 
   Download, 
@@ -37,10 +37,24 @@ import {
   ChevronDown,
   ChevronUp,
   Upload,
-  Check
+  Check,
+  Share2,
+  Sparkles,
+  CheckCircle2,
+  AlertCircle,
+  Clock,
+  FileJson as FileJsonIcon,
+  Monitor,
+  Play,
+  Pause,
+  RotateCcw,
+  RefreshCw,
+  Zap
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './utils';
+import { GoogleGenAI } from "@google/genai";
+import { io, Socket } from "socket.io-client";
 
 interface ProductVariant {
   id: string;
@@ -136,6 +150,134 @@ export default function App() {
   const [editingProduct, setEditingProduct] = useState<CollectedProduct | null>(null);
   const [batchEditType, setBatchEditType] = useState<'marketPrice' | 'salePrice' | 'tags' | null>(null);
   const [batchEditValue, setBatchEditValue] = useState('');
+
+  // Xiaohongshu Posting State
+  const [isPostingXHS, setIsPostingXHS] = useState(false);
+  const [activeXHSIndex, setActiveXHSIndex] = useState(0);
+  const [postingStatus, setPostingStatus] = useState<{
+    id: string, 
+    title: string, 
+    status: 'pending' | 'processing' | 'success' | 'error', 
+    generatedContent?: { title: string, body: string },
+    error?: string
+  }[]>([]);
+  const [xhsConfig, setXhsConfig] = useState({
+    style: '种草风',
+    includePrice: true,
+    customTags: '好物分享, 购物清单',
+    autoEmoji: true,
+    minInterval: 5,
+    maxInterval: 10
+  });
+
+  const [nextPublishTime, setNextPublishTime] = useState<number | null>(null);
+  const [countdown, setCountdown] = useState<number | null>(null);
+
+  // Automation State
+  const [automationLogs, setAutomationLogs] = useState<{message: string, type: 'info' | 'success' | 'error'}[]>([]);
+  const [browserView, setBrowserView] = useState<string | null>(null);
+  const [automationStep, setAutomationStep] = useState<string | null>(null);
+  const socketRef = useRef<Socket | null>(null);
+
+  useEffect(() => {
+    if (!nextPublishTime) {
+      setCountdown(null);
+      return;
+    }
+
+    const timer = setInterval(() => {
+      const remaining = Math.max(0, Math.floor((nextPublishTime - Date.now()) / 1000));
+      setCountdown(remaining);
+      if (remaining === 0) {
+        setNextPublishTime(null);
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [nextPublishTime]);
+
+  useEffect(() => {
+    socketRef.current = io();
+
+    socketRef.current.on("automation-log", (log) => {
+      setAutomationLogs(prev => [...prev, log].slice(-50));
+    });
+
+    socketRef.current.on("browser-view", (data) => {
+      setBrowserView(`data:image/jpeg;base64,${data.image}`);
+    });
+
+    socketRef.current.on("automation-step", (data) => {
+      setAutomationStep(data.step);
+    });
+
+    socketRef.current.on("product-status", (data) => {
+      setPostingStatus(prev => prev.map(s => s.id === data.id ? { ...s, status: data.status, error: data.error } : s));
+      
+      // Update the main products list status
+      if (data.status === 'success' || data.status === 'error') {
+        setProducts(prev => prev.map(p => p.id === data.id ? { ...p, xhsStatus: data.status === 'success' ? '发布成功' : '发布失败' } : p));
+      }
+    });
+
+    socketRef.current.on("automation-complete", () => {
+      setAutomationStep(null);
+      setNextPublishTime(null);
+      setCountdown(null);
+    });
+
+    socketRef.current.on("next-publish-time", (data: { time: number }) => {
+      setNextPublishTime(data.time);
+    });
+
+    return () => {
+      socketRef.current?.disconnect();
+    };
+  }, []);
+
+  const startXHSAutomation = () => {
+    if (selectedIds.size === 0) return;
+    
+    setIsPostingXHS(true);
+    setAutomationLogs([]);
+    setBrowserView(null);
+    
+    const selectedProducts = products.filter(p => selectedIds.has(p.id));
+    const orderedProducts = Array.from(selectedIds)
+      .map(id => selectedProducts.find(p => p.id === id))
+      .filter(Boolean) as CollectedProduct[];
+    
+    const initialStatus = orderedProducts.map(p => ({
+      id: p.id,
+      title: p.title,
+      status: 'pending' as const
+    }));
+    setPostingStatus(initialStatus);
+
+    socketRef.current?.emit("start-xhs-automation", {
+      products: orderedProducts,
+      config: xhsConfig
+    });
+  };
+
+  const handleBrowserClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    if (!socketRef.current) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    // Browser is 1280x800
+    const x = Math.round((e.clientX - rect.left) * (1280 / rect.width));
+    const y = Math.round((e.clientY - rect.top) * (800 / rect.height));
+    socketRef.current.emit("browser-click", { x, y });
+  };
+
+  const handleBrowserKeyDown = (e: React.KeyboardEvent) => {
+    if (!socketRef.current) return;
+    const key = e.key;
+    if (key.length === 1) {
+      socketRef.current.emit("browser-type", { text: key });
+    } else {
+      socketRef.current.emit("browser-type", { key });
+    }
+  };
 
   const handleCollect = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -647,6 +789,14 @@ export default function App() {
                         <Edit className="w-4 h-4" />
                         批量修改 tags
                       </button>
+                      <button 
+                        onClick={startXHSAutomation}
+                        disabled={selectedIds.size === 0 || isPostingXHS}
+                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-red-500 rounded-lg hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-sm hover:shadow-md"
+                      >
+                        <Share2 className="w-4 h-4" />
+                        自动发小红书
+                      </button>
                     </div>
 
                     {/* Table Container */}
@@ -672,6 +822,7 @@ export default function App() {
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">库存</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">采购价</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">采集时间</th>
+                            <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">发布状态</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">操作</th>
                           </tr>
                         </thead>
@@ -717,6 +868,21 @@ export default function App() {
                               <td className="px-4 py-4 text-sm text-slate-600">{product.purchasePrice}</td>
                               <td className="px-4 py-4 text-sm text-slate-400">
                                 {new Date(product.timestamp).toLocaleString()}
+                              </td>
+                              <td className="px-4 py-4">
+                                {product.xhsStatus === '发布成功' ? (
+                                  <span className="px-2 py-1 text-xs font-medium text-emerald-600 bg-emerald-50 rounded-full flex items-center gap-1 w-fit">
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    发布成功
+                                  </span>
+                                ) : product.xhsStatus === '发布失败' ? (
+                                  <span className="px-2 py-1 text-xs font-medium text-rose-600 bg-rose-50 rounded-full flex items-center gap-1 w-fit">
+                                    <AlertCircle className="w-3 h-3" />
+                                    发布失败
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-slate-400">未发布</span>
+                                )}
                               </td>
                               <td className="px-4 py-4">
                                 <div className="flex items-center justify-center gap-2">
@@ -884,6 +1050,93 @@ export default function App() {
                       <div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full shadow-sm" />
                     </div>
                   </div>
+
+                  {/* Xiaohongshu Settings */}
+                  <div className="pt-6 border-t border-slate-100">
+                    <h4 className="font-bold text-slate-900 mb-4 flex items-center gap-2">
+                      <Share2 className="w-4 h-4 text-red-500" />
+                      小红书发布设置
+                    </h4>
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">内容风格</label>
+                          <select 
+                            value={xhsConfig.style}
+                            onChange={(e) => setXhsConfig({...xhsConfig, style: e.target.value})}
+                            className="w-full h-10 px-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-red-500 outline-none"
+                          >
+                            <option value="种草风">种草风 (亲切自然)</option>
+                            <option value="专业风">专业风 (硬核测评)</option>
+                            <option value="文艺风">文艺风 (唯美意境)</option>
+                            <option value="幽默风">幽默风 (搞怪有趣)</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">自定义标签</label>
+                          <input 
+                            type="text"
+                            value={xhsConfig.customTags}
+                            onChange={(e) => setXhsConfig({...xhsConfig, customTags: e.target.value})}
+                            placeholder="多个标签用逗号分隔"
+                            className="w-full h-10 px-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-red-500 outline-none"
+                          />
+                        </div>
+                      </div>
+                      <div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100">
+                        <div className="flex items-center gap-3">
+                          <div className={cn(
+                            "w-10 h-6 rounded-full relative transition-colors cursor-pointer",
+                            xhsConfig.includePrice ? "bg-red-500" : "bg-slate-300"
+                          )} onClick={() => setXhsConfig({...xhsConfig, includePrice: !xhsConfig.includePrice})}>
+                            <motion.div 
+                              animate={{ x: xhsConfig.includePrice ? 24 : 4 }}
+                              className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                            />
+                          </div>
+                          <span className="text-sm font-medium text-slate-700">笔记中包含价格</span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <div className={cn(
+                            "w-10 h-6 rounded-full relative transition-colors cursor-pointer",
+                            xhsConfig.autoEmoji ? "bg-red-500" : "bg-slate-300"
+                          )} onClick={() => setXhsConfig({...xhsConfig, autoEmoji: !xhsConfig.autoEmoji})}>
+                            <motion.div 
+                              animate={{ x: xhsConfig.autoEmoji ? 24 : 4 }}
+                              className="absolute top-1 w-4 h-4 bg-white rounded-full shadow-sm"
+                            />
+                          </div>
+                          <span className="text-sm font-medium text-slate-700">自动添加 Emoji</span>
+                        </div>
+                      </div>
+                      <div className="p-4 bg-red-50 rounded-xl border border-red-100 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Clock className="w-4 h-4 text-red-500" />
+                            <span className="text-sm font-bold text-red-900">发布间隔区间 (分钟)</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <input 
+                              type="number" 
+                              value={xhsConfig.minInterval}
+                              onChange={(e) => setXhsConfig({...xhsConfig, minInterval: Number(e.target.value)})}
+                              className="w-16 h-9 bg-white border border-red-200 rounded-lg text-sm text-center focus:ring-2 focus:ring-red-500 outline-none font-bold text-red-600"
+                            />
+                            <span className="text-red-300">至</span>
+                            <input 
+                              type="number" 
+                              value={xhsConfig.maxInterval}
+                              onChange={(e) => setXhsConfig({...xhsConfig, maxInterval: Number(e.target.value)})}
+                              className="w-16 h-9 bg-white border border-red-200 rounded-lg text-sm text-center focus:ring-2 focus:ring-red-500 outline-none font-bold text-red-600"
+                            />
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-red-600/70 italic">
+                          * 系统将在每次发布后，从该区间随机抽取一个分钟数作为下一次发布的等待时间。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </motion.div>
             )}
@@ -943,6 +1196,225 @@ export default function App() {
           </motion.div>
         </div>
       )}
+      {/* Xiaohongshu Posting Progress Modal */}
+      <AnimatePresence>
+        {isPostingXHS && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 bg-black/60 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="bg-white rounded-3xl shadow-2xl w-full max-w-6xl overflow-hidden flex flex-col h-[90vh] border border-white/20"
+            >
+              <div className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-gradient-to-r from-red-50 to-white">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-red-500 rounded-xl flex items-center justify-center shadow-lg shadow-red-200">
+                    <Share2 className="text-white w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-slate-900 text-lg">小红书全自动发布助手</h3>
+                    <p className="text-xs text-slate-500">正在模拟人工发布流程，请在下方窗口观察进度...</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-4">
+                  {automationStep && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 bg-red-50 text-red-600 rounded-full text-xs font-bold animate-pulse">
+                      <Zap className="w-3 h-3" />
+                      {automationStep}
+                    </div>
+                  )}
+                  <button 
+                    onClick={() => setIsPostingXHS(false)}
+                    className="p-2 hover:bg-slate-100 rounded-full transition-colors"
+                  >
+                    <X className="w-5 h-5 text-slate-400" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex-1 flex overflow-hidden">
+                {/* Left: Queue & Logs */}
+                <div className="w-80 border-r border-slate-100 bg-slate-50 flex flex-col">
+                  {/* Queue */}
+                  <div className="p-4 border-b border-slate-200 flex-shrink-0">
+                    <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4 px-2">发布队列 ({postingStatus.length})</h4>
+                    <div className="space-y-1 max-h-48 overflow-y-auto pr-2">
+                      {postingStatus.map((item, idx) => (
+                        <div 
+                          key={item.id}
+                          className={cn(
+                            "w-full flex items-center gap-3 p-2 rounded-lg text-left transition-all",
+                            activeXHSIndex === idx ? "bg-white shadow-sm ring-1 ring-red-100" : ""
+                          )}
+                        >
+                          <div className="flex-shrink-0">
+                            {item.status === 'pending' && <Clock className="w-3 h-3 text-slate-300" />}
+                            {item.status === 'processing' && <Loader2 className="w-3 h-3 text-red-500 animate-spin" />}
+                            {item.status === 'success' && <CheckCircle2 className="w-3 h-3 text-emerald-500" />}
+                            {item.status === 'error' && <AlertCircle className="w-3 h-3 text-rose-500" />}
+                          </div>
+                          <span className={cn(
+                            "text-[10px] font-medium truncate",
+                            activeXHSIndex === idx ? "text-slate-900" : "text-slate-500"
+                          )}>{item.title}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Logs */}
+                  <div className="flex-1 flex flex-col overflow-hidden">
+                    <div className="p-4 border-b border-slate-200 bg-slate-100/50 flex items-center justify-between">
+                      <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">运行日志</h4>
+                      <div className="flex gap-1">
+                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500/50" />
+                      </div>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-4 font-mono text-[10px] space-y-2 bg-slate-900 text-slate-300">
+                      {automationLogs.length === 0 && (
+                        <div className="text-slate-500 italic">等待任务启动...</div>
+                      )}
+                      {automationLogs.map((log, i) => (
+                        <div key={i} className={cn(
+                          "break-words",
+                          log.type === 'success' ? "text-emerald-400" : 
+                          log.type === 'error' ? "text-rose-400" : "text-slate-300"
+                        )}>
+                          <span className="text-slate-500 mr-2">[{new Date().toLocaleTimeString()}]</span>
+                          {log.message}
+                        </div>
+                      ))}
+                      <div id="logs-end" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Right: Browser View */}
+                <div className="flex-1 bg-slate-200 relative overflow-hidden flex flex-col">
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    {browserView ? (
+                      <div className="relative w-full h-full flex items-center justify-center bg-black">
+                        <img 
+                          src={browserView} 
+                          alt="Browser View" 
+                          className="max-w-full max-h-full object-contain cursor-crosshair outline-none"
+                          onClick={handleBrowserClick}
+                          onKeyDown={handleBrowserKeyDown}
+                          tabIndex={0}
+                        />
+                        <div className="absolute bottom-4 right-4 px-2 py-1 bg-black/40 text-white/60 text-[8px] rounded pointer-events-none">
+                          点击画面可交互 • 键盘输入可同步
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center gap-4 text-slate-400">
+                        <Monitor className="w-12 h-12 animate-pulse" />
+                        <p className="text-sm font-medium">正在启动浏览器环境...</p>
+                      </div>
+                    )}
+                  </div>
+                  
+                  {/* Browser Overlay Info */}
+                  <div className="absolute top-4 left-4 right-4 flex justify-between pointer-events-none">
+                    <div className="px-3 py-1.5 bg-black/60 backdrop-blur-md rounded-lg text-white text-[10px] font-bold flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                      LIVE BROWSER STREAM
+                    </div>
+                    <div className="px-3 py-1.5 bg-black/60 backdrop-blur-md rounded-lg text-white text-[10px] font-bold">
+                      1280 x 720
+                    </div>
+                  </div>
+
+                  {/* Instructions Overlay */}
+                  <div className="absolute bottom-4 left-4 right-4 p-4 bg-white/90 backdrop-blur-md rounded-2xl shadow-xl border border-white/20">
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center flex-shrink-0">
+                        <Zap className="text-white w-5 h-5" />
+                      </div>
+                      <div className="flex-1">
+                        <h5 className="text-sm font-bold text-slate-900">
+                          {automationStep === 'login' ? '正在等待登录' : (automationStep || "准备就绪")}
+                        </h5>
+                        <p className="text-xs text-slate-500">
+                          {automationStep === 'login' 
+                            ? '请在上方窗口中扫码，或点击输入框使用键盘登录。系统正在自动执行操作，请勿关闭此窗口。' 
+                            : '系统正在自动执行操作，请勿关闭此窗口。您可以随时点击画面进行手动干预。'}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-4">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-bold text-slate-400 uppercase">发布间隔 (分钟)</span>
+                          <div className="flex items-center gap-1">
+                            <input 
+                              type="number" 
+                              value={xhsConfig.minInterval}
+                              onChange={(e) => setXhsConfig({...xhsConfig, minInterval: Number(e.target.value)})}
+                              className="w-12 h-6 bg-slate-100 border border-slate-200 rounded text-[10px] text-center focus:ring-1 focus:ring-red-500 outline-none"
+                            />
+                            <span className="text-slate-400">-</span>
+                            <input 
+                              type="number" 
+                              value={xhsConfig.maxInterval}
+                              onChange={(e) => setXhsConfig({...xhsConfig, maxInterval: Number(e.target.value)})}
+                              className="w-12 h-6 bg-slate-100 border border-slate-200 rounded text-[10px] text-center focus:ring-1 focus:ring-red-500 outline-none"
+                            />
+                          </div>
+                        </div>
+                        {countdown !== null && (
+                          <div className="px-3 py-1 bg-red-500 text-white rounded-lg text-[10px] font-bold flex items-center gap-2 animate-pulse">
+                            <Clock className="w-3 h-3" />
+                            下次发布倒计时: {Math.floor(countdown / 60)}分 {countdown % 60}秒
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {automationStep === 'login' && (
+                          <>
+                            <button
+                              onClick={() => socketRef.current?.emit("reload-page")}
+                              className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
+                            >
+                              <RefreshCw className="w-3 h-3" />
+                              刷新页面
+                            </button>
+                            <button
+                              onClick={() => socketRef.current?.emit("manual-start-posting")}
+                              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-lg shadow-indigo-200 transition-all flex items-center gap-2"
+                            >
+                              <Play className="w-3 h-3 fill-current" />
+                              已登录，开始发布
+                            </button>
+                          </>
+                        )}
+                        <div className="px-3 py-1 bg-slate-100 rounded-lg text-[10px] font-bold text-slate-500">
+                          INTERVAL: {xhsConfig.interval}s
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="px-8 py-4 border-t border-slate-100 bg-slate-50 flex justify-between items-center text-[10px] text-slate-400">
+                <div className="flex items-center gap-4">
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    SOCKET CONNECTED
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-indigo-500" />
+                    PUPPETEER ACTIVE
+                  </div>
+                </div>
+                <div>
+                  AI STUDIO BUILD • AUTOMATION ENGINE v1.0
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       {/* Edit Product Modal */}
       {editingProduct && (
