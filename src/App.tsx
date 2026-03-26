@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   LayoutDashboard, 
   Download, 
@@ -53,8 +53,55 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './utils';
-import { GoogleGenAI } from "@google/genai";
 import { io, Socket } from "socket.io-client";
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+class ErrorBoundary extends (React.Component as any) {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    const state = this.state as any;
+    if (state.hasError) {
+      let message = "发生了一些错误。";
+      message = state.error.message || message;
+
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center border border-slate-200">
+            <div className="w-16 h-16 bg-rose-100 rounded-full flex items-center justify-center mx-auto mb-6">
+              <AlertCircle className="w-8 h-8 text-rose-600" />
+            </div>
+            <h1 className="text-2xl font-bold text-slate-900 mb-2">出错了</h1>
+            <p className="text-slate-600 mb-8">{message}</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-3 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-colors"
+            >
+              刷新页面
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (this.props as any).children;
+  }
+}
 
 interface ProductVariant {
   id: string;
@@ -97,6 +144,14 @@ interface CollectedProduct {
   carouselImages: string[];
   options: ProductOption[];
   variants: ProductVariant[];
+  
+  // Original USD prices for toggle
+  usdMarketPrice?: string;
+  usdPurchasePrice?: string;
+  
+  // WeChat Automation Status
+  wechatStatus?: 'pending' | 'success' | 'failed';
+  wechatMessage?: string;
 }
 
 const SidebarItem = ({ 
@@ -131,7 +186,22 @@ const SidebarItem = ({
 );
 
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+const formatDate = (timestamp: any) => {
+  if (!timestamp) return '未知时间';
+  const date = /^\d+$/.test(timestamp.toString()) ? new Date(Number(timestamp)) : new Date(timestamp);
+  return date.toString() === 'Invalid Date' ? '未知时间' : date.toLocaleString();
+};
+
+function AppContent() {
   const [activeTab, setActiveTab] = useState('collect');
+  const [dbStatus, setDbStatus] = useState<{success: boolean, message: string, productCount?: number, error?: string} | null>(null);
   const [url, setUrl] = useState('');
   const [isCollecting, setIsCollecting] = useState(false);
   const [collectType, setCollectType] = useState<'single' | 'series'>('single');
@@ -142,13 +212,15 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [jumpPage, setJumpPage] = useState('1');
+  const [exchangeRate, setExchangeRate] = useState(7.2);
+  const [isConverting, setIsConverting] = useState(false);
 
   // Selection State
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   // Modal State
   const [editingProduct, setEditingProduct] = useState<CollectedProduct | null>(null);
-  const [batchEditType, setBatchEditType] = useState<'marketPrice' | 'salePrice' | 'tags' | null>(null);
+  const [batchEditType, setBatchEditType] = useState<'marketPrice' | 'salePrice' | 'purchasePrice' | 'tags' | null>(null);
   const [batchEditValue, setBatchEditValue] = useState('');
 
   // Xiaohongshu Posting State
@@ -167,7 +239,8 @@ export default function App() {
     customTags: '好物分享, 购物清单',
     autoEmoji: true,
     minInterval: 5,
-    maxInterval: 10
+    maxInterval: 10,
+    aiModel: 'gemini'
   });
 
   const [nextPublishTime, setNextPublishTime] = useState<number | null>(null);
@@ -177,7 +250,60 @@ export default function App() {
   const [automationLogs, setAutomationLogs] = useState<{message: string, type: 'info' | 'success' | 'error'}[]>([]);
   const [browserView, setBrowserView] = useState<string | null>(null);
   const [automationStep, setAutomationStep] = useState<string | null>(null);
+  const [isXhsPaused, setIsXhsPaused] = useState(false);
   const socketRef = useRef<Socket | null>(null);
+
+  const fetchProducts = useCallback(async () => {
+    try {
+      const response = await fetch("/api/products");
+      const data = await response.json();
+      console.log('Fetched products:', data);
+      if (Array.isArray(data)) {
+        setProducts(data);
+      } else {
+        console.error("API returned non-array data:", data);
+        setProducts([]);
+      }
+    } catch (err) {
+      console.error("Failed to fetch products:", err);
+      setProducts([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    const checkDb = async () => {
+      try {
+        const res = await fetch("/api/db-status");
+        const data = await res.json();
+        setDbStatus(data);
+      } catch (err) {
+        setDbStatus({ success: false, message: "无法连接到后端" });
+      }
+    };
+
+    const fetchSettings = async () => {
+      try {
+        const res = await fetch("/api/settings");
+        if (res.ok) {
+          const data = await res.json();
+          if (data && Object.keys(data).length > 0) {
+            setXhsConfig(prev => ({ ...prev, ...data }));
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch settings:", err);
+      }
+    };
+
+    checkDb();
+    fetchSettings();
+    const interval = setInterval(checkDb, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    fetchProducts();
+  }, [fetchProducts]);
 
   useEffect(() => {
     if (!nextPublishTime) {
@@ -199,8 +325,13 @@ export default function App() {
   useEffect(() => {
     socketRef.current = io();
 
+    socketRef.current.on("products-changed", fetchProducts);
+
     socketRef.current.on("automation-log", (log) => {
-      setAutomationLogs(prev => [...prev, log].slice(-50));
+      setAutomationLogs(prev => {
+        const current = Array.isArray(prev) ? prev : [];
+        return [...current, log].slice(-50);
+      });
     });
 
     socketRef.current.on("browser-view", (data) => {
@@ -212,11 +343,20 @@ export default function App() {
     });
 
     socketRef.current.on("product-status", (data) => {
-      setPostingStatus(prev => prev.map(s => s.id === data.id ? { ...s, status: data.status, error: data.error } : s));
+      console.log("Received product-status:", data);
+      setPostingStatus(prev => {
+        const newStatus = prev.map(s => s.id === data.id ? { ...s, status: data.status, error: data.error } : s);
+        console.log("Updated postingStatus:", newStatus);
+        return newStatus;
+      });
       
       // Update the main products list status
       if (data.status === 'success' || data.status === 'error') {
-        setProducts(prev => prev.map(p => p.id === data.id ? { ...p, xhsStatus: data.status === 'success' ? '发布成功' : '发布失败' } : p));
+        setProducts(prev => {
+          const newProducts = prev.map(p => p.id === data.id ? { ...p, xhsStatus: data.status === 'success' ? '发布成功' : '发布失败' } : p);
+          console.log("Updated products status:", newProducts.find(p => p.id === data.id));
+          return newProducts;
+        });
       }
     });
 
@@ -224,6 +364,7 @@ export default function App() {
       setAutomationStep(null);
       setNextPublishTime(null);
       setCountdown(null);
+      setIsPostingXHS(false);
     });
 
     socketRef.current.on("next-publish-time", (data: { time: number }) => {
@@ -231,9 +372,10 @@ export default function App() {
     });
 
     return () => {
+      socketRef.current?.off("products-changed", fetchProducts);
       socketRef.current?.disconnect();
     };
-  }, []);
+  }, [fetchProducts]);
 
   const startXHSAutomation = () => {
     if (selectedIds.size === 0) return;
@@ -242,7 +384,7 @@ export default function App() {
     setAutomationLogs([]);
     setBrowserView(null);
     
-    const selectedProducts = products.filter(p => selectedIds.has(p.id));
+    const selectedProducts = (Array.isArray(products) ? products : []).filter(p => selectedIds.has(p.id));
     const orderedProducts = Array.from(selectedIds)
       .map(id => selectedProducts.find(p => p.id === id))
       .filter(Boolean) as CollectedProduct[];
@@ -291,44 +433,17 @@ export default function App() {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, socketId: socketRef.current?.id }),
       });
 
       const result = await response.json();
+      console.log('Collection result:', result);
 
       if (result.success) {
-        if (collectType === 'single') {
-          const newProduct: CollectedProduct = {
-            ...result.data,
-            id: Math.random().toString(36).substr(2, 9),
-            timestamp: Date.now(),
-            title: result.data.title || '未命名产品',
-            price: result.data.price || '0.00',
-            marketPrice: result.data.price || '0.00',
-            productType: result.data.type || '未分类',
-            sku: 'SKU-' + Math.random().toString(36).substr(2, 5).toUpperCase(),
-            inventory: 1000,
-            purchasePrice: '0.00',
-            tags: result.data.tags || [],
-          };
-          setProducts([newProduct, ...products]);
-        } else {
-          const newProducts: CollectedProduct[] = result.data.map((p: any) => ({
-            ...p,
-            id: Math.random().toString(36).substr(2, 9),
-            timestamp: Date.now(),
-            title: p.title || '未命名产品',
-            price: p.price || '0.00',
-            marketPrice: p.price || '0.00',
-            productType: p.type || '未分类',
-            sku: 'SKU-' + Math.random().toString(36).substr(2, 5).toUpperCase(),
-            inventory: 1000,
-            purchasePrice: '0.00',
-            tags: p.tags || [],
-          }));
-          setProducts([...newProducts, ...products]);
-        }
+        // Products are now saved directly by the backend.
+        // The products-changed socket event will trigger fetchProducts().
         setUrl('');
+        fetchProducts();
       } else {
         setError(result.error || '采集产品失败');
       }
@@ -339,17 +454,29 @@ export default function App() {
     }
   };
 
-  const removeProduct = (id: string) => {
-    setProducts(products.filter(p => p.id !== id));
-    const newSelected = new Set(selectedIds);
-    newSelected.delete(id);
-    setSelectedIds(newSelected);
+  const removeProduct = async (id: string) => {
+    try {
+      await fetch(`/api/products/${id}`, { method: 'DELETE' });
+      const newSelected = new Set(selectedIds);
+      newSelected.delete(id);
+      setSelectedIds(newSelected);
+    } catch (error) {
+      console.error("Failed to delete product:", error);
+    }
   };
 
-  const batchDelete = () => {
+  const batchDelete = async () => {
     if (selectedIds.size === 0) return;
-    setProducts(products.filter(p => !selectedIds.has(p.id)));
-    setSelectedIds(new Set());
+    try {
+      await fetch('/api/products/batch-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: Array.from(selectedIds) }),
+      });
+      setSelectedIds(new Set());
+    } catch (error) {
+      console.error("Failed to batch delete products:", error);
+    }
   };
 
   const toggleSelectAll = () => {
@@ -374,20 +501,38 @@ export default function App() {
     setSelectedIds(newSelected);
   };
 
-  const handleBatchUpdate = () => {
+  const handleBatchUpdate = async () => {
     if (!batchEditType || selectedIds.size === 0) return;
     
-    setProducts(products.map(p => {
-      if (selectedIds.has(p.id)) {
-        if (batchEditType === 'marketPrice') return { ...p, marketPrice: batchEditValue };
-        if (batchEditType === 'salePrice') return { ...p, price: batchEditValue };
-        if (batchEditType === 'tags') return { ...p, tags: batchEditValue.split(',').map(t => t.trim()).filter(t => t) };
+    try {
+      let updates: any = {};
+      if (batchEditType === 'marketPrice') updates.marketPrice = batchEditValue;
+      if (batchEditType === 'salePrice') updates.price = batchEditValue;
+      if (batchEditType === 'purchasePrice') updates.purchasePrice = batchEditValue;
+      if (batchEditType === 'tags') updates.tags = batchEditValue.split(',').map(t => t.trim()).filter(t => t);
+
+      const response = await fetch('/api/products/batch-update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ids: Array.from(selectedIds),
+          updates
+        }),
+      });
+
+      if (response.ok) {
+        setBatchEditType(null);
+        setBatchEditValue('');
+        setSelectedIds(new Set());
+        alert("批量修改成功，数据库已同步。");
+      } else {
+        console.error("Failed to batch update products");
+        alert("批量修改失败，请检查网络或数据库连接。");
       }
-      return p;
-    }));
-    
-    setBatchEditType(null);
-    setBatchEditValue('');
+    } catch (error) {
+      console.error("Failed to batch update products:", error);
+      alert("批量修改过程中发生错误。");
+    }
   };
 
   const generateVariants = (options: ProductOption[]) => {
@@ -456,15 +601,84 @@ export default function App() {
     updateOptions(newOptions);
   };
 
-  const handleUpdateProduct = (updated: CollectedProduct) => {
-    setProducts(products.map(p => p.id === updated.id ? updated : p));
-    setEditingProduct(null);
+  const handlePauseXHS = () => {
+    if (socketRef.current) {
+      socketRef.current.emit("pause-xhs-automation");
+      setIsXhsPaused(true);
+    }
+  };
+
+  const handleResumeXHS = () => {
+    if (socketRef.current) {
+      socketRef.current.emit("resume-xhs-automation");
+      setIsXhsPaused(false);
+    }
+  };
+
+  const handleSaveSettings = async () => {
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(xhsConfig)
+      });
+      if (res.ok) {
+        alert("设置已保存");
+      } else {
+        alert("保存失败");
+      }
+    } catch (err) {
+      console.error("Failed to save settings:", err);
+      alert("保存出错");
+    }
+  };
+
+  const handleUpdateProduct = async (updated: CollectedProduct) => {
+    try {
+      const { id, ...data } = updated;
+      const response = await fetch(`/api/products/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      
+      if (response.ok) {
+        setEditingProduct(null);
+        alert("产品信息已成功同步至数据库。");
+      } else {
+        console.error("Failed to update product");
+        alert("保存失败，请检查数据库连接。");
+      }
+    } catch (error) {
+      console.error("Failed to update product:", error);
+      alert("保存过程中发生错误。");
+    }
   };
 
   // Pagination Logic
-  const totalItems = products.length;
+  const totalItems = Array.isArray(products) ? products.length : 0;
   const totalPages = Math.ceil(totalItems / pageSize);
-  const paginatedProducts = products.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const paginatedProducts = (Array.isArray(products) ? products : []).slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  useEffect(() => {
+    const socket = io();
+    
+    socket.on("wechat-status-updated", (data: { id: string, status: 'success' | 'failed', message?: string }) => {
+      setProducts(prev => prev.map(p => {
+        if (p.id === data.id) {
+          return { ...p, wechatStatus: data.status, wechatMessage: data.message };
+        }
+        return p;
+      }));
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
+
+  // Sync products to server for Python script to access
+  // Removed syncProducts useEffect as server now reads directly from Firestore
 
   const handleJumpPage = () => {
     const page = parseInt(jumpPage);
@@ -473,8 +687,112 @@ export default function App() {
     }
   };
 
+  const handleCurrencyConversion = async () => {
+    if (selectedIds.size === 0) return;
+    
+    // Check if we are toggling back to USD
+    const firstSelected = (Array.isArray(products) ? products : []).find(p => selectedIds.has(p.id));
+    const isCurrentlyRMB = firstSelected?.marketPrice.includes('元');
+
+    if (isCurrentlyRMB) {
+      // Toggle back to USD
+      try {
+        for (const id of Array.from(selectedIds)) {
+          const p = products.find(prod => prod.id === id);
+          if (p) {
+            await fetch(`/api/products/${id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                marketPrice: p.usdMarketPrice || p.marketPrice.replace(' 元', ''),
+                purchasePrice: p.usdPurchasePrice || p.purchasePrice.replace(' 元', ''),
+              }),
+            });
+          }
+        }
+        setAutomationLogs(prev => [...prev, { message: `已恢复为美元价格`, type: 'info' }]);
+      } catch (error) {
+        console.error("Failed to reset currency:", error);
+      }
+      return;
+    }
+
+    setIsConverting(true);
+    try {
+      // Fetch real-time exchange rate (USD to CNY)
+      const response = await fetch('https://api.exchangerate-api.com/v4/latest/USD');
+      const data = await response.json();
+      const rate = data.rates.CNY || 7.2;
+      setExchangeRate(rate);
+
+      for (const id of Array.from(selectedIds)) {
+        const p = (Array.isArray(products) ? products : []).find(prod => prod.id === id);
+        if (p) {
+          const convert = (priceStr: string) => {
+            const numMatch = priceStr.match(/[\d.]+/);
+            if (!numMatch) return priceStr;
+            const num = parseFloat(numMatch[0]);
+            if (isNaN(num)) return priceStr;
+            return (num * rate).toFixed(2) + " 元";
+          };
+          
+          const usdMarketPrice = p.usdMarketPrice || p.marketPrice;
+          const usdPurchasePrice = p.usdPurchasePrice || p.purchasePrice;
+
+          await fetch(`/api/products/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              usdMarketPrice,
+              usdPurchasePrice,
+              marketPrice: convert(p.marketPrice),
+              purchasePrice: convert(p.purchasePrice),
+            }),
+          });
+        }
+      }
+      setAutomationLogs(prev => [...prev, { message: `汇率转换成功: 1 USD = ${rate} CNY`, type: 'success' }]);
+    } catch (err) {
+      console.error("Failed to fetch exchange rate:", err);
+      // Fallback to manual rate if API fails
+      try {
+        for (const id of Array.from(selectedIds)) {
+          const p = (Array.isArray(products) ? products : []).find(prod => prod.id === id);
+          if (p) {
+            const convert = (priceStr: string) => {
+              const numMatch = priceStr.match(/[\d.]+/);
+              if (!numMatch) return priceStr;
+              const num = parseFloat(numMatch[0]);
+              if (isNaN(num)) return priceStr;
+              return (num * exchangeRate).toFixed(2) + " 元";
+            };
+            
+            const usdMarketPrice = p.usdMarketPrice || p.marketPrice;
+            const usdPurchasePrice = p.usdPurchasePrice || p.purchasePrice;
+
+            await fetch(`/api/products/${id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                usdMarketPrice,
+                usdPurchasePrice,
+                marketPrice: convert(p.marketPrice),
+                purchasePrice: convert(p.purchasePrice),
+              }),
+            });
+          }
+        }
+        setAutomationLogs(prev => [...prev, { message: `汇率转换成功 (使用默认汇率 ${exchangeRate})`, type: 'success' }]);
+      } catch (error) {
+        console.error("Failed to convert currency:", error);
+      }
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
   const exportToJSON = () => {
-    if (products.length === 0) return;
+    if (!Array.isArray(products) || products.length === 0) return;
     const dataStr = JSON.stringify(products, null, 2);
     const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
     const exportFileDefaultName = `shopns_products_${new Date().getTime()}.json`;
@@ -486,9 +804,9 @@ export default function App() {
   };
 
   const exportToCSV = () => {
-    if (products.length === 0) return;
+    if (!Array.isArray(products) || products.length === 0) return;
     const headers = ['ID', 'Title', 'Price', 'URL', 'Description', 'Timestamp'];
-    const rows = products.map(p => [
+    const rows = (Array.isArray(products) ? products : []).map(p => [
       p.id,
       `"${p.title.replace(/"/g, '""')}"`,
       `"${p.price.replace(/"/g, '""')}"`,
@@ -511,6 +829,12 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const openWeChat = () => {
+    // Attempt to open WeChat via protocol
+    window.location.href = 'weixin://';
+    setAutomationLogs(prev => [...prev, { message: '尝试唤起本地微信...', type: 'info' }]);
   };
 
   return (
@@ -554,7 +878,16 @@ export default function App() {
           />
         </nav>
 
-        <div className="p-4 border-t border-slate-100">
+        <div className="p-4 border-t border-slate-100 space-y-2">
+          <button 
+            onClick={openWeChat}
+            className="w-full flex items-center gap-3 p-2 rounded-lg hover:bg-green-50 text-slate-600 hover:text-green-600 transition-all group"
+          >
+            <div className="w-8 h-8 rounded-lg bg-green-100 flex items-center justify-center group-hover:bg-green-200 transition-colors">
+              <Globe className="w-5 h-5 text-green-600" />
+            </div>
+            <span className="text-sm font-medium">打开本地微信</span>
+          </button>
           <div className="flex items-center gap-3 p-2 rounded-lg bg-slate-50">
             <div className="w-8 h-8 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-xs">
               JD
@@ -578,7 +911,7 @@ export default function App() {
               {activeTab === 'dashboard' && "数据概览"}
               {activeTab === 'settings' && "系统设置"}
             </h2>
-            {activeTab === 'products' && products.length > 0 && (
+            {activeTab === 'products' && Array.isArray(products) && products.length > 0 && (
               <div className="flex items-center gap-2 ml-4">
                 <button 
                   onClick={exportToCSV}
@@ -598,6 +931,20 @@ export default function App() {
             )}
           </div>
           <div className="flex items-center gap-4">
+            {dbStatus && (
+              <div className={cn(
+                "flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border",
+                dbStatus.success 
+                  ? "bg-emerald-50 text-emerald-600 border-emerald-100" 
+                  : "bg-rose-50 text-rose-600 border-rose-100"
+              )}>
+                <div className={cn(
+                  "w-1.5 h-1.5 rounded-full",
+                  dbStatus.success ? "bg-emerald-500" : "bg-rose-500"
+                )} />
+                {dbStatus.success ? `数据库已连接 (${dbStatus.productCount})` : `数据库错误: ${dbStatus.error || dbStatus.message}`}
+              </div>
+            )}
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
               <input 
@@ -710,7 +1057,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {products.length > 0 && (
+                {Array.isArray(products) && products.length > 0 && (
                   <div className="mt-12">
                     <div className="flex items-center justify-between mb-6">
                       <h3 className="text-xl font-bold">最近采集</h3>
@@ -722,7 +1069,7 @@ export default function App() {
                       </button>
                     </div>
                     <div className="grid grid-cols-2 gap-6">
-                      {products.slice(0, 4).map((product) => (
+                      {(Array.isArray(products) ? products : []).slice(0, 4).map((product) => (
                         <ProductCard key={product.id} product={product} onRemove={removeProduct} />
                       ))}
                     </div>
@@ -739,7 +1086,7 @@ export default function App() {
                 exit={{ opacity: 0 }}
                 className="flex flex-col h-full"
               >
-                {products.length === 0 ? (
+                {Array.isArray(products) && products.length === 0 ? (
                   <div className="py-20 text-center">
                     <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
                       <Package className="text-slate-400 w-10 h-10" />
@@ -766,6 +1113,14 @@ export default function App() {
                         删除
                       </button>
                       <button 
+                        onClick={handleCurrencyConversion}
+                        disabled={selectedIds.size === 0 || isConverting}
+                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-indigo-600 bg-white border border-slate-200 rounded-lg hover:bg-indigo-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <RefreshCw className={cn("w-4 h-4", isConverting && "animate-spin")} />
+                        {"一键汇率转换 (USD -> CNY)"}
+                      </button>
+                      <button 
                         onClick={() => setBatchEditType('marketPrice')}
                         disabled={selectedIds.size === 0}
                         className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -780,6 +1135,14 @@ export default function App() {
                       >
                         <Edit className="w-4 h-4" />
                         批量修改 销售价
+                      </button>
+                      <button 
+                        onClick={() => setBatchEditType('purchasePrice')}
+                        disabled={selectedIds.size === 0}
+                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <Edit className="w-4 h-4" />
+                        批量修改 采购价
                       </button>
                       <button 
                         onClick={() => setBatchEditType('tags')}
@@ -816,13 +1179,15 @@ export default function App() {
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">商品主图</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">商品名称</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">Product Type</th>
+                            <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">来源</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">市场价</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">销售价</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">SKU</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">库存</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">采购价</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">采集时间</th>
-                            <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">发布状态</th>
+                            <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">小红书状态</th>
+                            <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider">微信状态</th>
                             <th className="px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center">操作</th>
                           </tr>
                         </thead>
@@ -861,19 +1226,34 @@ export default function App() {
                                 </div>
                               </td>
                               <td className="px-4 py-4 text-sm text-slate-600">{product.productType}</td>
-                              <td className="px-4 py-4 text-sm text-slate-600">{product.marketPrice}</td>
-                              <td className="px-4 py-4 text-sm font-semibold text-indigo-600">{product.price}</td>
+                              <td className="px-4 py-4 text-sm text-slate-600">
+                                {product.supplierLink ? (
+                                  <a 
+                                    href={product.supplierLink} 
+                                    target="_blank" 
+                                    rel="noopener noreferrer"
+                                    className="text-indigo-600 hover:text-indigo-800 flex items-center gap-1"
+                                  >
+                                    <ExternalLink className="w-3 h-3" />
+                                    查看
+                                  </a>
+                                ) : (
+                                  <span className="text-slate-400">-</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-4 text-sm text-slate-600">{product.marketPrice}{!product.marketPrice.includes('元') && ' 美元'}</td>
+                              <td className="px-4 py-4 text-sm font-semibold text-indigo-600">{product.price}{!product.price.includes('元') && ' 美元'}</td>
                               <td className="px-4 py-4 text-sm text-slate-600 font-mono">{product.sku}</td>
                               <td className="px-4 py-4 text-sm text-slate-600">{product.inventory}</td>
-                              <td className="px-4 py-4 text-sm text-slate-600">{product.purchasePrice}</td>
+                              <td className="px-4 py-4 text-sm text-slate-600">{product.purchasePrice}{!product.purchasePrice.includes('元') && ' 美元'}</td>
                               <td className="px-4 py-4 text-sm text-slate-400">
-                                {new Date(product.timestamp).toLocaleString()}
+                                {formatDate(product.timestamp)}
                               </td>
                               <td className="px-4 py-4">
                                 {product.xhsStatus === '发布成功' ? (
                                   <span className="px-2 py-1 text-xs font-medium text-emerald-600 bg-emerald-50 rounded-full flex items-center gap-1 w-fit">
                                     <CheckCircle2 className="w-3 h-3" />
-                                    发布成功
+                                    已发布
                                   </span>
                                 ) : product.xhsStatus === '发布失败' ? (
                                   <span className="px-2 py-1 text-xs font-medium text-rose-600 bg-rose-50 rounded-full flex items-center gap-1 w-fit">
@@ -882,6 +1262,21 @@ export default function App() {
                                   </span>
                                 ) : (
                                   <span className="text-xs text-slate-400">未发布</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-4">
+                                {product.wechatStatus === 'success' ? (
+                                  <span className="px-2 py-1 text-xs font-medium text-emerald-600 bg-emerald-50 rounded-full flex items-center gap-1 w-fit">
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    已同步
+                                  </span>
+                                ) : product.wechatStatus === 'failed' ? (
+                                  <span className="px-2 py-1 text-xs font-medium text-rose-600 bg-rose-50 rounded-full flex items-center gap-1 w-fit" title={product.wechatMessage}>
+                                    <AlertCircle className="w-3 h-3" />
+                                    同步失败
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-slate-400">未同步</span>
                                 )}
                               </td>
                               <td className="px-4 py-4">
@@ -1010,7 +1405,7 @@ export default function App() {
                 animate={{ opacity: 1 }}
                 className="grid grid-cols-4 gap-6"
               >
-                <StatCard label="总采集数" value={products.length.toString()} trend="+12%" />
+                <StatCard label="总采集数" value={(Array.isArray(products) ? products.length : 0).toString()} trend="+12%" />
                 <StatCard label="进行中任务" value="3" trend="稳定" />
                 <StatCard label="采集成功率" value="98.2%" trend="+0.5%" />
                 <StatCard label="已导出" value="1,240" trend="+240" />
@@ -1060,6 +1455,17 @@ export default function App() {
                     <div className="space-y-4">
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1.5">
+                          <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">AI 模型选择</label>
+                          <select 
+                            value={xhsConfig.aiModel}
+                            onChange={(e) => setXhsConfig({...xhsConfig, aiModel: e.target.value})}
+                            className="w-full h-10 px-3 bg-red-50 border border-red-200 rounded-xl text-sm focus:ring-2 focus:ring-red-500 outline-none font-bold text-red-600"
+                          >
+                            <option value="gemini">Google Gemini (默认)</option>
+                            <option value="qwen">Alibaba Qwen (通义千问)</option>
+                          </select>
+                        </div>
+                        <div className="space-y-1.5">
                           <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">内容风格</label>
                           <select 
                             value={xhsConfig.style}
@@ -1072,16 +1478,16 @@ export default function App() {
                             <option value="幽默风">幽默风 (搞怪有趣)</option>
                           </select>
                         </div>
-                        <div className="space-y-1.5">
-                          <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">自定义标签</label>
-                          <input 
-                            type="text"
-                            value={xhsConfig.customTags}
-                            onChange={(e) => setXhsConfig({...xhsConfig, customTags: e.target.value})}
-                            placeholder="多个标签用逗号分隔"
-                            className="w-full h-10 px-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-red-500 outline-none"
-                          />
-                        </div>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">自定义标签</label>
+                        <input 
+                          type="text"
+                          value={xhsConfig.customTags}
+                          onChange={(e) => setXhsConfig({...xhsConfig, customTags: e.target.value})}
+                          placeholder="多个标签用逗号分隔"
+                          className="w-full h-10 px-3 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:ring-2 focus:ring-red-500 outline-none"
+                        />
                       </div>
                       <div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100">
                         <div className="flex items-center gap-3">
@@ -1135,6 +1541,15 @@ export default function App() {
                           * 系统将在每次发布后，从该区间随机抽取一个分钟数作为下一次发布的等待时间。
                         </p>
                       </div>
+                      <div className="pt-4">
+                        <button 
+                          onClick={handleSaveSettings}
+                          className="w-full py-3 bg-red-500 text-white rounded-xl font-bold shadow-lg shadow-red-200 hover:bg-red-600 transition-all flex items-center justify-center gap-2"
+                        >
+                          <Save className="w-4 h-4" />
+                          保存设置
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -1154,7 +1569,7 @@ export default function App() {
           >
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-lg font-bold">
-                批量修改 {batchEditType === 'marketPrice' ? '市场价' : batchEditType === 'salePrice' ? '销售价' : 'Tags'}
+                批量修改 {batchEditType === 'marketPrice' ? '市场价' : batchEditType === 'salePrice' ? '销售价' : batchEditType === 'purchasePrice' ? '采购价' : 'Tags'}
               </h3>
               <button onClick={() => setBatchEditType(null)} className="text-slate-400 hover:text-slate-600">
                 <X className="w-5 h-5" />
@@ -1223,8 +1638,33 @@ export default function App() {
                       {automationStep}
                     </div>
                   )}
+                  {isPostingXHS && (
+                    <div className="flex items-center gap-2">
+                      {isXhsPaused ? (
+                        <button 
+                          onClick={handleResumeXHS}
+                          className="flex items-center gap-1.5 px-4 py-1.5 bg-emerald-500 text-white rounded-full text-xs font-bold hover:bg-emerald-600 transition-all shadow-sm"
+                        >
+                          <Play className="w-3 h-3 fill-current" />
+                          继续发布
+                        </button>
+                      ) : (
+                        <button 
+                          onClick={handlePauseXHS}
+                          className="flex items-center gap-1.5 px-4 py-1.5 bg-amber-500 text-white rounded-full text-xs font-bold hover:bg-amber-600 transition-all shadow-sm"
+                        >
+                          <Pause className="w-3 h-3 fill-current" />
+                          暂停发布
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <button 
-                    onClick={() => setIsPostingXHS(false)}
+                    onClick={() => {
+                      if (isXhsPaused) handleResumeXHS();
+                      socketRef.current?.emit("stop-xhs-automation");
+                      setIsPostingXHS(false);
+                    }}
                     className="p-2 hover:bg-slate-100 rounded-full transition-colors"
                   >
                     <X className="w-5 h-5 text-slate-400" />
@@ -1281,7 +1721,7 @@ export default function App() {
                           log.type === 'success' ? "text-emerald-400" : 
                           log.type === 'error' ? "text-rose-400" : "text-slate-300"
                         )}>
-                          <span className="text-slate-500 mr-2">[{new Date().toLocaleTimeString()}]</span>
+                          <span className="text-slate-500 mr-2">[{log.timestamp || new Date().toLocaleTimeString()}]</span>
                           {log.message}
                         </div>
                       ))}
@@ -1523,6 +1963,58 @@ export default function App() {
                       placeholder="URL 别名"
                     />
                   </div>
+
+                  <div className="col-span-12">
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">标签 (用逗号分隔)</label>
+                    <input 
+                      type="text"
+                      value={editingProduct.tags?.join(', ') || ''}
+                      onChange={(e) => setEditingProduct({ ...editingProduct, tags: e.target.value.split(',').map(t => t.trim()).filter(t => t) })}
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-sm"
+                      placeholder="例如: 热销, 新品, 夏季"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Section: Pricing */}
+              <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
+                <div className="flex items-center gap-2 mb-6 pb-4 border-b border-slate-100">
+                  <div className="w-2 h-6 bg-indigo-600 rounded-full" />
+                  <h4 className="font-bold text-slate-900">价格信息</h4>
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">销售价 (美元)</label>
+                    <input 
+                      type="text"
+                      value={editingProduct.price}
+                      onChange={(e) => setEditingProduct({ ...editingProduct, price: e.target.value })}
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-sm font-bold text-indigo-600"
+                      placeholder="0.00"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">市场价 (美元)</label>
+                    <input 
+                      type="text"
+                      value={editingProduct.marketPrice}
+                      onChange={(e) => setEditingProduct({ ...editingProduct, marketPrice: e.target.value })}
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-sm"
+                      placeholder="0.00"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">采购价 (人民币)</label>
+                    <input 
+                      type="text"
+                      value={editingProduct.purchasePrice}
+                      onChange={(e) => setEditingProduct({ ...editingProduct, purchasePrice: e.target.value })}
+                      className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-sm"
+                      placeholder="0.00"
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -1636,8 +2128,8 @@ export default function App() {
                         <tr className="bg-slate-50 text-slate-500 uppercase text-[10px] font-bold tracking-wider">
                           <th className="px-4 py-3 text-left rounded-l-lg">规格</th>
                           <th className="px-4 py-3 text-left">SKU</th>
-                          <th className="px-4 py-3 text-left">市场价</th>
-                          <th className="px-4 py-3 text-left">销售价</th>
+                          <th className="px-4 py-3 text-left">市场价 (美元)</th>
+                          <th className="px-4 py-3 text-left">销售价 (美元)</th>
                           <th className="px-4 py-3 text-left">库存</th>
                           <th className="px-4 py-3 text-right rounded-r-lg">操作</th>
                         </tr>
@@ -1846,7 +2338,7 @@ const ProductCard = ({ product, onRemove }: ProductCardProps) => (
       </div>
       <p className="text-xs text-slate-500 line-clamp-2 mb-3">{product.description}</p>
       <div className="flex items-center justify-between text-[10px] text-slate-400 font-medium">
-        <span>采集于 {new Date(product.timestamp).toLocaleDateString()}</span>
+        <span>采集于 {formatDate(product.timestamp)}</span>
         <span className="px-2 py-0.5 bg-slate-100 rounded-full uppercase tracking-wider">有效</span>
       </div>
     </div>
